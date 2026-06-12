@@ -1,10 +1,11 @@
 from __future__ import annotations as _annotations
 
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from copy import copy
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
+from datetime import datetime
 from functools import cached_property
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, NoReturn, TypeGuard
@@ -16,11 +17,12 @@ from typing_extensions import assert_never
 
 from pydantic_ai._instrumentation import model_attributes, model_request_parameters_attributes
 from pydantic_ai._run_context import RunContext
-from pydantic_ai._utils import await_maybe, get_first_param_type
+<<<<<<< HEAD
+from pydantic_ai._utils import await_maybe, get_first_param_type, now_utc as _now_utc
 
 from .._genai_prices import fill_response_cost
 from ..exceptions import FallbackExceptionGroup, ModelAPIError, UserError
-from ..messages import ModelResponse
+from ..messages import ModelResponse, ModelResponseResetEvent, ModelResponseStreamEvent
 from ..profiles import ModelProfile
 from . import (
     KnownModelName,
@@ -80,6 +82,138 @@ def _is_response_handler(handler: Callable[..., Any]) -> bool:
 def _is_exception_type(value: Any) -> TypeGuard[type[Exception]]:
     """Check if value is a single exception type."""
     return isinstance(value, type) and issubclass(value, Exception)
+
+
+@dataclass(frozen=True)
+class _StreamRequestArgs:
+    messages: list[ModelMessage]
+    model_settings: ModelSettings | None
+    model_request_parameters: ModelRequestParameters
+    run_context: RunContext[Any] | None
+
+
+@dataclass(kw_only=True)
+class _FallbackStreamedResponse(StreamedResponse):
+    _models: list[Model]
+    _request_args: _StreamRequestArgs
+    _exit_stack: AsyncExitStack
+    _should_fallback_handler: Callable[[Exception | ModelResponse], Awaitable[bool]]
+    _on_model_selected: Callable[[Model, ModelRequestParameters], None]
+    _next_model_index: int = field(default=0, init=False)
+    _exceptions: list[Exception] = field(default_factory=list[Exception], init=False)
+    _rejected_responses: list[ModelResponse] = field(default_factory=list[ModelResponse], init=False)
+    _current_model: Model | None = field(default=None, init=False)
+    _current_stream: StreamedResponse | None = field(default=None, init=False)
+    _current_prepared_parameters: ModelRequestParameters | None = field(default=None, init=False)
+    _accepted_model: Model | None = field(default=None, init=False)
+    _created_timestamp: datetime = field(default_factory=_now_utc, init=False)
+
+    async def open_next_stream(self) -> None:
+        while self._next_model_index < len(self._models):
+            model = self._models[self._next_model_index]
+            self._next_model_index += 1
+
+            try:
+                _, prepared_parameters = model.prepare_request(
+                    self._request_args.model_settings, self._request_args.model_request_parameters
+                )
+                prepared_messages = model.prepare_messages(self._request_args.messages)
+                stream = await self._exit_stack.enter_async_context(
+                    model.request_stream(
+                        prepared_messages,
+                        self._request_args.model_settings,
+                        self._request_args.model_request_parameters,
+                        self._request_args.run_context,
+                    )
+                )
+            except Exception as exc:
+                if await self._should_fallback_handler(exc):
+                    self._exceptions.append(exc)
+                    continue
+                raise exc
+
+            self._current_model = model
+            self._current_stream = stream
+            self._current_prepared_parameters = prepared_parameters
+            self._sync_current_stream()
+            return
+
+        _raise_fallback_exception_group(self._exceptions, self._rejected_responses)
+
+    async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:
+        while current_stream := self._current_stream:
+            try:
+                async for event in current_stream._get_event_iterator():
+                    self._sync_current_stream()
+                    yield event
+            except Exception as exc:
+                self._sync_current_stream()
+                if await self._should_fallback_handler(exc):
+                    self._exceptions.append(exc)
+                    yield ModelResponseResetEvent(response=current_stream.get())
+                    await self.open_next_stream()
+                    continue
+                raise exc
+
+            current_stream._finished = True
+            self._sync_current_stream()
+            response = current_stream.get()
+            if await self._should_fallback_handler(response):
+                self._rejected_responses.append(response)
+                yield ModelResponseResetEvent(response=response)
+                await self.open_next_stream()
+                continue
+
+            assert self._current_model is not None
+            assert self._current_prepared_parameters is not None
+            self._accepted_model = self._current_model
+            self._on_model_selected(self._current_model, self._current_prepared_parameters)
+            return
+
+    async def close_stream(self) -> None:
+        if self._current_stream is None:
+            return
+        await self._current_stream.close_stream()
+
+    def get_stream_cancel_errors(self) -> tuple[type[BaseException], ...]:
+        if self._current_stream is None:
+            return super().get_stream_cancel_errors()
+        return self._current_stream.get_stream_cancel_errors()
+
+    def _sync_current_stream(self) -> None:
+        if self._current_stream is None:
+            return
+        object.__setattr__(self, '_parts_manager', self._current_stream._parts_manager)
+        self._usage = self._current_stream.usage
+        self.provider_response_id = self._current_stream.provider_response_id
+        self.provider_details = self._current_stream.provider_details
+        self.finish_reason = self._current_stream.finish_reason
+
+    @property
+    def model_name(self) -> str:
+        if self._accepted_model is not None:
+            return self._accepted_model.model_name
+        if self._current_model is not None:
+            return self._current_model.model_name
+        return 'fallback:pending'
+
+    @property
+    def provider_name(self) -> str | None:
+        if self._current_stream is None:
+            return None
+        return self._current_stream.provider_name
+
+    @property
+    def provider_url(self) -> str | None:
+        if self._current_stream is None:
+            return None
+        return self._current_stream.provider_url
+
+    @property
+    def timestamp(self) -> datetime:
+        if self._current_stream is None:
+            return self._created_timestamp
+        return self._current_stream.timestamp
 
 
 @dataclass(init=False)
@@ -327,11 +461,32 @@ class FallbackModel(Model):
     ) -> AsyncGenerator[StreamedResponse]:
         """Try each model in sequence until one succeeds.
 
+        A response handler uses a composite stream so rejected responses and mid-stream failures can
+        reset the consumer and continue with the next fallback model.
+
         If a previous response set `state='suspended'`, the request is routed directly
         to the pinned continuation model, bypassing the fallback chain. If the pinned model
         raises a fallback-eligible error while opening the stream, the messages are rewound
         and the normal fallback chain is tried. Mid-stream failures still propagate.
         """
+        if self._response_handlers:
+            async with AsyncExitStack() as stack:
+                response = _FallbackStreamedResponse(
+                    model_request_parameters=model_request_parameters,
+                    _models=self.models,
+                    _request_args=_StreamRequestArgs(
+                        messages=messages,
+                        model_settings=model_settings,
+                        model_request_parameters=model_request_parameters,
+                        run_context=run_context,
+                    ),
+                    _exit_stack=stack,
+                    _should_fallback_handler=self._should_fallback,
+                    _on_model_selected=self._set_span_attributes,
+                )
+                await response.open_next_stream()
+                yield response
+                return
         exceptions: list[Exception] = []
         # Set once a pinned continuation fails and we rewind to the chain: see the non-streaming `request`.
         rewound = False

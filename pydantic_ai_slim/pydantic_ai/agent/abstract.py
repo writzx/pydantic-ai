@@ -1055,16 +1055,14 @@ class AbstractAgent(Generic[AgentDepsT, OutputDataT], ABC):
                                 by `StreamedRunResult._marked_completed`.
                                 """
                                 nonlocal final_result
-                                if stream._raw_stream_response.final_result_event is not None:  # pyright: ignore[reportPrivateUsage]
-                                    final_result_event = stream._raw_stream_response.final_result_event  # pyright: ignore[reportPrivateUsage]
-                                    final_result = FinalResult(
-                                        final_result.output,
-                                        final_result_event.tool_name,
-                                        final_result_event.tool_call_id,
-                                    )
-                                final_result = FinalResult(
-                                    await stream.get_output(), final_result.tool_name, final_result.tool_call_id
+                                # Relink tool ids to the accepted candidate's final result event,
+                                # in case a `FallbackModel` discarded the originally committed one.
+                                accepted_event = stream._raw_stream_response.final_result_event  # pyright: ignore[reportPrivateUsage]
+                                tool_name = accepted_event.tool_name if accepted_event else final_result.tool_name
+                                tool_call_id = (
+                                    accepted_event.tool_call_id if accepted_event else final_result.tool_call_id
                                 )
+                                final_result = FinalResult(await stream.get_output(), tool_name, tool_call_id)
 
                                 # When we get here, the `ModelRequestNode` has completed streaming after the final result was found.
                                 # When running an agent with `agent.run`, we'd then move to `CallToolsNode` to execute the tool calls and

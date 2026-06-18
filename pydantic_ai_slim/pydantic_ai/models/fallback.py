@@ -17,7 +17,6 @@ from typing_extensions import assert_never
 
 from pydantic_ai._instrumentation import model_attributes, model_request_parameters_attributes
 from pydantic_ai._run_context import RunContext
-<<<<<<< HEAD
 from pydantic_ai._utils import await_maybe, get_first_param_type, now_utc as _now_utc
 
 from .._genai_prices import fill_response_cost
@@ -106,7 +105,6 @@ class _FallbackStreamedResponse(StreamedResponse):
     _current_stream: StreamedResponse | None = field(default=None, init=False)
     _current_prepared_parameters: ModelRequestParameters | None = field(default=None, init=False)
     _accepted_model: Model | None = field(default=None, init=False)
-    _created_timestamp: datetime = field(default_factory=_now_utc, init=False)
 
     async def open_next_stream(self) -> None:
         while self._next_model_index < len(self._models):
@@ -145,7 +143,10 @@ class _FallbackStreamedResponse(StreamedResponse):
         _raise_fallback_exception_group(self._exceptions, self._rejected_responses)
 
     async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:
-        while current_stream := self._current_stream:
+        # `open_next_stream()` runs before the response is yielded, so `_current_stream`
+        # is set on entry. Subsequent iterations either `continue` after another
+        # `open_next_stream()` (which sets it again or raises) or `return`.
+        while current_stream := self._current_stream:  # pragma: no branch
             try:
                 async for event in current_stream._get_event_iterator():
                     self._sync_current_stream()
@@ -180,20 +181,17 @@ class _FallbackStreamedResponse(StreamedResponse):
             return
 
     async def close_stream(self) -> None:
-        if self._current_stream is None:
-            return
+        assert self._current_stream is not None, 'open_next_stream must run before close_stream'
         await self._current_stream.close_stream()
 
     def get_stream_cancel_errors(self) -> tuple[type[BaseException], ...]:
-        if self._current_stream is None:
-            return super().get_stream_cancel_errors()
+        assert self._current_stream is not None, 'open_next_stream must run before get_stream_cancel_errors'
         return self._current_stream.get_stream_cancel_errors()
 
     def _sync_current_stream(self) -> None:
         # Mirror per-event mutable state. Provider id/details may be set lazily on the first
         # chunk, so we keep mirroring them rather than binding once per candidate.
-        if self._current_stream is None:
-            return
+        assert self._current_stream is not None
         self._usage = self._current_stream.usage
         self.provider_response_id = self._current_stream.provider_response_id
         self.provider_details = self._current_stream.provider_details
@@ -210,20 +208,17 @@ class _FallbackStreamedResponse(StreamedResponse):
 
     @property
     def provider_name(self) -> str | None:
-        if self._current_stream is None:
-            return None
+        assert self._current_stream is not None
         return self._current_stream.provider_name
 
     @property
     def provider_url(self) -> str | None:
-        if self._current_stream is None:
-            return None
+        assert self._current_stream is not None
         return self._current_stream.provider_url
 
     @property
     def timestamp(self) -> datetime:
-        if self._current_stream is None:
-            return self._created_timestamp
+        assert self._current_stream is not None
         return self._current_stream.timestamp
 
 

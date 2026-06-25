@@ -115,7 +115,9 @@ class _FallbackStreamedResponse(StreamedResponse):
                 _, prepared_parameters = model.prepare_request(
                     self._request_args.model_settings, self._request_args.model_request_parameters
                 )
-                prepared_messages = model.prepare_messages(self._request_args.messages)
+                prepared_messages = model.prepare_messages(
+                    self._request_args.messages, self._request_args.model_request_parameters
+                )
                 stream = await self._exit_stack.enter_async_context(
                     model.request_stream(
                         prepared_messages,
@@ -467,15 +469,16 @@ class FallbackModel(Model):
     ) -> AsyncGenerator[StreamedResponse]:
         """Try each model in sequence until one succeeds.
 
-        A response handler uses a composite stream so rejected responses and mid-stream failures can
-        reset the consumer and continue with the next fallback model.
+        A composite stream handles rejected responses and mid-stream failures by resetting the
+        consumer and continuing with the next fallback model.
 
         If a previous response set `state='suspended'`, the request is routed directly
         to the pinned continuation model, bypassing the fallback chain. If the pinned model
         raises a fallback-eligible error while opening the stream, the messages are rewound
-        and the normal fallback chain is tried. Mid-stream failures still propagate.
+        and the normal fallback chain is tried.
         """
-        if self._response_handlers:
+        pinned = self._get_continuation_model(messages)
+        if self._response_handlers or pinned is None:
             async with AsyncExitStack() as stack:
                 response = _FallbackStreamedResponse(
                     model_request_parameters=model_request_parameters,
@@ -497,7 +500,7 @@ class FallbackModel(Model):
         # Set once a pinned continuation fails and we rewind to the chain: see the non-streaming `request`.
         rewound = False
 
-        if pinned := self._get_continuation_model(messages):
+        if pinned:
             # `_get_continuation_model` only returns a model when the last message is a suspended response.
             suspended_response = messages[-1]
             assert isinstance(suspended_response, ModelResponse)

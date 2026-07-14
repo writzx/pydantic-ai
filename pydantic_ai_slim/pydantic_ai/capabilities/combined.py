@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from pydantic_ai.output import OutputContext
     from pydantic_ai.result import FinalResult
     from pydantic_ai.run import AgentRunResult
+    from pydantic_ai.sandbox import Sandbox
     from pydantic_graph import End
 
 
@@ -73,6 +74,10 @@ class CombinedCapability(AbstractCapability[AgentDepsT]):
     @property
     def has_wrap_run_event_stream(self) -> bool:
         return any(c.has_wrap_run_event_stream for c in self.capabilities)
+
+    @property
+    def has_get_sandbox(self) -> bool:
+        return any(c.has_get_sandbox for c in self.capabilities)
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractCapability[AgentDepsT]:
         new_caps = await gather(*(c.for_run(ctx) for c in self.capabilities))
@@ -200,6 +205,22 @@ class CombinedCapability(AbstractCapability[AgentDepsT]):
                 wrapped = result
                 any_wrapped = True
         return wrapped if any_wrapped else None
+
+    async def get_sandbox(self, ctx: RunContext[AgentDepsT]) -> Sandbox | None:
+        # The capability latest in the resolved chain wins, matching the reversed dispatch of
+        # `after_run`/`get_wrapper_toolset` and the later-wins model-settings merge. Earlier
+        # capabilities are only consulted when every later one returned None, so a losing
+        # capability never acquires a sandbox it would immediately have to discard. Deferred
+        # capabilities that aren't loaded are skipped: their `wrap_run` never entered, so a
+        # sandbox acquired there would have no teardown bracket and would leak.
+        for capability in reversed(self.capabilities):
+            if not capability.has_get_sandbox:
+                continue
+            if (cap_ctx := _ctx_for_available_cap(capability, ctx)) is not None:
+                sandbox = await capability.get_sandbox(cap_ctx)
+                if sandbox is not None:
+                    return sandbox
+        return None
 
     # --- Tool preparation hooks ---
 

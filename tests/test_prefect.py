@@ -7,7 +7,7 @@ from collections.abc import AsyncIterable, AsyncIterator, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Literal, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -34,12 +34,14 @@ from pydantic_ai import (
     ToolCallPart,
     UserPromptPart,
 )
+from pydantic_ai._run_context import SandboxHolder
 from pydantic_ai.capabilities import Instrumentation
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, UserError
 from pydantic_ai.models import create_async_http_client
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.sandbox import Sandbox
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDefinition
 from pydantic_ai.toolsets._dynamic import DynamicToolset
 from pydantic_ai.usage import RequestUsage, RunUsage
@@ -1371,6 +1373,55 @@ async def test_cache_policy_empty_inputs():
     assert result is None
 
 
+class FakeCacheSandbox:
+    """Minimal stand-in carrying only the identity the cache key needs."""
+
+    provider = 'fake'
+
+    def __init__(self, sandbox_id: str):
+        self.sandbox_id = sandbox_id
+
+
+def _ctx_with_sandbox(sandbox_id: str | None) -> RunContext[None]:
+    sandbox = cast(Sandbox, FakeCacheSandbox(sandbox_id)) if sandbox_id is not None else None
+    return RunContext(
+        deps=None,
+        model=TestModel(),
+        usage=RunUsage(),
+        _sandbox_holder=SandboxHolder(value=sandbox),
+    )
+
+
+async def test_cache_policy_includes_sandbox_id():
+    """Two runs identical except for their attached sandbox must not share a cache entry."""
+    projected = _replace_run_context({'ctx': _ctx_with_sandbox('sandbox-1')})['ctx']
+    assert projected['sandbox_id'] == 'sandbox-1'
+    assert _replace_run_context({'ctx': _ctx_with_sandbox(None)})['ctx']['sandbox_id'] is None
+
+    cache_policy = PrefectAgentInputs()
+    mock_task_ctx = MagicMock()
+    keys = {
+        cache_policy.compute_key(
+            task_ctx=mock_task_ctx,
+            inputs={'ctx': _ctx_with_sandbox(sandbox_id)},
+            flow_parameters={},
+        )
+        for sandbox_id in ('sandbox-1', 'sandbox-2', None)
+    }
+    assert len(keys) == 3
+
+    # Same sandbox identity produces the same key: the live handle itself is not hashed.
+    assert cache_policy.compute_key(
+        task_ctx=mock_task_ctx,
+        inputs={'ctx': _ctx_with_sandbox('sandbox-1')},
+        flow_parameters={},
+    ) == cache_policy.compute_key(
+        task_ctx=mock_task_ctx,
+        inputs={'ctx': _ctx_with_sandbox('sandbox-1')},
+        flow_parameters={},
+    )
+
+
 def test_cache_key_run_context_projection_is_exhaustive():
     """Every `RunContext` field must be consciously categorized for Prefect cache-key hashing.
 
@@ -1404,14 +1455,20 @@ def test_cache_key_run_context_projection_is_exhaustive():
         'capability_loaded',  # transient per-hook flag; `None` during tool execution
         '_mcp_tool_defs_cache',  # live per-run memo of MCP tool defs, reconstructed from messages
     }
+    # Fields carried into the projection under a derived key rather than verbatim.
+    projected_via_derived_key = {
+        '_sandbox_holder',  # projected as 'sandbox_id': only the sandbox's stable identity forks the key
+    }
     ctx = RunContext(deps=None, model=TestModel(), usage=RunUsage())
     projected = set(_replace_run_context({'ctx': ctx})['ctx'])
+    assert 'sandbox_id' in projected
+
     all_fields = set(RunContext.__dataclass_fields__)
 
     overlap = projected & cache_irrelevant
     assert not overlap, f'Fields both projected and marked irrelevant: {overlap}'
 
-    uncategorized = all_fields - (projected | cache_irrelevant)
+    uncategorized = all_fields - (projected | cache_irrelevant | projected_via_derived_key)
     assert not uncategorized, (
         f'Uncategorized `RunContext` fields: {uncategorized}. Add each to the `_replace_run_context` '
         'projection (if it should fork the cache key) or to `cache_irrelevant` (with a reason).'

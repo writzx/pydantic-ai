@@ -130,6 +130,7 @@ from .profiles import (
     ModelProfileSpec,
 )
 from .run import AgentRun, AgentRunResult, AgentRunResultEvent
+from .sandbox import Sandbox
 from .settings import ModelSettings, ToolChoice, ToolOrOutput
 from .tools import (
     AgentNativeTool,
@@ -310,6 +311,8 @@ __all__ = (
     # capabilities
     'AgentCapability',
     'CapabilityFunc',
+    # sandbox
+    'Sandbox',
     # output
     'ToolOutput',
     'NativeOutput',

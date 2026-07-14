@@ -52,6 +52,11 @@ def _replace_run_context(
                 # entry. `_strip_cache_excluded_fields` recurses into the `UsageLimits` dataclass to
                 # hash it by value; `None` (bare/synthetic context) hashes distinctly.
                 'usage_limits': value.usage_limits,
+                # The run's sandbox must fork the key: a tool that executes commands in
+                # `ctx.sandbox` produces different results in different environments, so two runs
+                # identical except for their sandbox must not share a cache entry. The handle is
+                # live in-process for Prefect tasks; only its stable identity is hashed.
+                'sandbox_id': value.sandbox.sandbox_id if value.sandbox is not None else None,
             }
 
     return inputs

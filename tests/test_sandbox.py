@@ -442,3 +442,139 @@ async def test_wrap_run_error_before_handler_never_resolves_sandbox():
     with pytest.raises(RuntimeError, match='pre-handler failure'):
         await agent.run('go')
     assert not any('get_sandbox' in entry for entry in cap.log)
+
+
+async def test_toolset_enter_failure_tears_down_capability_sandbox():
+    """A toolset `__aenter__` failure must still unwind the wrap chain: the capability's
+    `wrap_run` finally runs (sandbox teardown), and `_wrap_task` is not left pending."""
+
+    class ExplodingToolset(WrapperToolset[Any]):
+        async def __aenter__(self) -> Any:
+            raise RuntimeError('toolset entry failed')
+
+    inner: FunctionToolset[Any] = FunctionToolset()
+
+    @inner.tool
+    async def noop(ctx: RunContext[Any]) -> str:
+        return 'ok'
+
+    cap = SandboxCapability(name='cap')
+    agent: Agent = Agent(_tool_call_then_text('noop'), toolsets=[ExplodingToolset(wrapped=inner)], capabilities=[cap])
+    with pytest.raises(RuntimeError, match='toolset entry failed'):
+        await agent.run('go')
+
+    assert any(entry == 'cap:get_sandbox' for entry in cap.log)
+    assert any(entry == 'cap:wrap_exit' for entry in cap.log), 'wrap_run finally must run on toolset-entry failure'
+    import asyncio
+
+    await asyncio.sleep(0)
+    pending_wrap_tasks = [
+        t for t in asyncio.all_tasks() if not t.done() and 'wrap_run' in (t.get_coro().__qualname__ or '')
+    ]
+    assert not pending_wrap_tasks, f'the wrap task must not be left pending: {pending_wrap_tasks}'
+
+
+async def test_get_sandbox_failure_propagates_and_unwinds():
+    """An exception from `get_sandbox` fails the run like a `before_run` failure, and every
+    capability's `wrap_run` still unwinds."""
+    outer = SandboxCapability(name='outer')
+
+    @dataclass
+    class Failing(SandboxCapability):
+        async def get_sandbox(self, ctx: RunContext[Any]) -> Sandbox | None:
+            self.log.append(f'{self.name}:get_sandbox')
+            raise RuntimeError('acquisition failed')
+
+    failing = Failing(name='failing')
+    seen: list[str] = []
+    agent = make_probe_agent(seen, capabilities=[outer, failing])
+    with pytest.raises(RuntimeError, match='acquisition failed'):
+        await agent.run('go')
+
+    # The later-in-chain capability was consulted first and raised; the earlier one was never asked.
+    assert any('failing:get_sandbox' in e for e in failing.log)
+    assert not any('outer:get_sandbox' in e for e in outer.log)
+    # Both wrap_run frames unwound.
+    assert any('failing:wrap_exit' in e for e in failing.log)
+    assert any('outer:wrap_exit' in e for e in outer.log)
+    assert seen == []
+
+
+async def test_combined_subclass_get_sandbox_override_contributes():
+    """A `CombinedCapability` subclass overriding `get_sandbox` itself (not via leaves) must be
+    detected by `has_get_sandbox` even when wrapped."""
+    from pydantic_ai.capabilities import CombinedCapability
+
+    @dataclass
+    class Container(CombinedCapability[Any]):
+        async def get_sandbox(self, ctx: RunContext[Any]) -> Sandbox | None:
+            return FakeSandbox('container')
+
+    @dataclass
+    class Plain(AbstractCapability[Any]):
+        pass
+
+    container = Container(capabilities=[Plain()])
+    assert container.has_get_sandbox
+    wrapper = WrapperCapability(wrapped=container)
+    assert wrapper.has_get_sandbox
+
+    seen: list[str] = []
+    agent = make_probe_agent(seen, capabilities=[wrapper])
+    await agent.run('go')
+    assert seen == ['container']
+
+
+async def test_concurrent_runs_get_isolated_sandboxes():
+    """Two concurrent runs on one agent with one capability prototype must not share or
+    cross-destroy sandboxes (the documented `for_run` -> `replace(self)` pattern)."""
+    import asyncio
+
+    observed: dict[str, Any] = {}
+    release = asyncio.Event()
+
+    def slow_model(name: str) -> FunctionModel:
+        def model_func(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if len(messages) == 1:
+                return ModelResponse(parts=[ToolCallPart('probe', {})])
+            return ModelResponse(parts=[TextPart('done')])
+
+        return FunctionModel(model_func)
+
+    prototype = SandboxCapability(name='proto')
+    agent: Agent = Agent(slow_model('m'), capabilities=[prototype])
+
+    @agent.tool
+    async def probe(ctx: RunContext[Any]) -> str:
+        run_id = ctx.run_id
+        assert run_id is not None
+        observed[run_id] = ctx.sandbox
+        # Hold the first run open until the second has observed its own sandbox.
+        if len(observed) < 2:
+            await asyncio.wait_for(release.wait(), timeout=5)
+        else:
+            release.set()
+        return 'ok'
+
+    await asyncio.gather(agent.run('one'), agent.run('two'))
+    sandboxes = list(observed.values())
+    assert len(sandboxes) == 2
+    assert sandboxes[0] is not sandboxes[1]
+    assert all(sb is not None and sb.destroyed for sb in sandboxes)
+    assert prototype.acquired is None
+
+
+async def test_metadata_factory_final_evaluation_sees_capability_sandbox():
+    """Metadata factories run at run start (no capability sandbox yet) and again at run end,
+    where the capability sandbox is still live. Pins the documented nuance."""
+    calls: list[str] = []
+
+    def metadata_factory(ctx: RunContext[Any]) -> dict[str, Any]:
+        calls.append(_describe(ctx.sandbox))
+        return {}
+
+    seen: list[str] = []
+    agent = make_probe_agent(seen, capabilities=[SandboxCapability(name='cap')])
+    await agent.run('go', metadata=metadata_factory)
+    assert calls[0] == 'none'
+    assert calls[-1] == 'cap'

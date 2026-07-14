@@ -1579,10 +1579,22 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
 
             stack.callback(_restore_context_vars)
 
-            # Enter toolset AFTER context vars are propagated so that
-            # toolset __aenter__/__aexit__ run inside the run span context
-            # (set by the Instrumentation capability's wrap_run).
-            await stack.enter_async_context(toolset)
+            try:
+                # Enter toolset AFTER context vars are propagated so that
+                # toolset __aenter__/__aexit__ run inside the run span context
+                # (set by the Instrumentation capability's wrap_run).
+                await stack.enter_async_context(toolset)
+            except BaseException as exc:
+                # A failure here (e.g. a toolset `__aenter__` raising) would otherwise leave
+                # `_do_run` parked on `_run_done.wait()` forever: the wrap chain never unwinds,
+                # capability `wrap_run` cleanup (`finally` blocks holding resources such as a
+                # capability-contributed sandbox) never runs, and `_wrap_task` leaks as a
+                # permanently pending task. Mirror the readiness-wait failure path above:
+                # unpark `_do_run`, drain the wrap chain, then re-raise.
+                _run_error = exc
+                _run_done.set()
+                await _utils.cancel_and_drain(_ready_waiter, _wrap_task)
+                raise
 
             async def _finalize_result(r: AgentRunResult[Any]) -> None:
                 """Call after_run, store the result override, and clear any pending error."""

@@ -1392,11 +1392,13 @@ def _ctx_with_sandbox(sandbox_id: str | None) -> RunContext[None]:
     )
 
 
-async def test_cache_policy_includes_sandbox_id():
+async def test_cache_policy_includes_sandbox_identity():
     """Two runs identical except for their attached sandbox must not share a cache entry."""
     projected = _replace_run_context({'ctx': _ctx_with_sandbox('sandbox-1')})['ctx']
-    assert projected['sandbox_id'] == 'sandbox-1'
-    assert _replace_run_context({'ctx': _ctx_with_sandbox(None)})['ctx']['sandbox_id'] is None
+    # Provider-qualified: `sandbox_id` is only unique within a provider.
+    assert projected['sandbox'] == ('fake', 'sandbox-1')
+    # No sandbox -> no key at all, so pre-existing no-sandbox cache keys are unchanged.
+    assert 'sandbox' not in _replace_run_context({'ctx': _ctx_with_sandbox(None)})['ctx']
 
     cache_policy = PrefectAgentInputs()
     mock_task_ctx = MagicMock()
@@ -1409,6 +1411,22 @@ async def test_cache_policy_includes_sandbox_id():
         for sandbox_id in ('sandbox-1', 'sandbox-2', None)
     }
     assert len(keys) == 3
+
+    # Same id under a different provider is a different environment -> different key.
+    class OtherProviderSandbox(FakeCacheSandbox):
+        provider = 'other'
+
+    other = RunContext(
+        deps=None,
+        model=TestModel(),
+        usage=RunUsage(),
+        _sandbox_holder=SandboxHolder(value=cast(Sandbox, OtherProviderSandbox('sandbox-1'))),
+    )
+    assert cache_policy.compute_key(
+        task_ctx=mock_task_ctx, inputs={'ctx': other}, flow_parameters={}
+    ) != cache_policy.compute_key(
+        task_ctx=mock_task_ctx, inputs={'ctx': _ctx_with_sandbox('sandbox-1')}, flow_parameters={}
+    )
 
     # Same sandbox identity produces the same key: the live handle itself is not hashed.
     assert cache_policy.compute_key(
@@ -1457,11 +1475,11 @@ def test_cache_key_run_context_projection_is_exhaustive():
     }
     # Fields carried into the projection under a derived key rather than verbatim.
     projected_via_derived_key = {
-        '_sandbox_holder',  # projected as 'sandbox_id': only the sandbox's stable identity forks the key
+        '_sandbox_holder',  # projected as 'sandbox' (provider, sandbox_id), only when a sandbox is attached
     }
     ctx = RunContext(deps=None, model=TestModel(), usage=RunUsage())
     projected = set(_replace_run_context({'ctx': ctx})['ctx'])
-    assert 'sandbox_id' in projected
+    assert 'sandbox' in set(_replace_run_context({'ctx': _ctx_with_sandbox('sb')})['ctx'])
 
     all_fields = set(RunContext.__dataclass_fields__)
 

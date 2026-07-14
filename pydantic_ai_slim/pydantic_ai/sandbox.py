@@ -241,9 +241,10 @@ class Sandbox(Protocol):
     def sandbox_id(self) -> str:
         """The implementation's stable identifier for this sandbox, unique per provider.
 
-        This is the durable reference: it is what a durable-execution workflow should carry
-        across serialization boundaries (on `deps` or `metadata`) so activity-side code can
-        re-open the environment using the implementation's own reconnection surface.
+        Together with `provider` this is the durable reference: it is what a durable-execution
+        workflow should carry across serialization boundaries (on `deps` or `metadata`) so
+        activity-side code can re-open the environment using the implementation's own
+        reconnection surface. On its own it is not globally unique.
         """
         ...
 
@@ -272,9 +273,10 @@ class Sandbox(Protocol):
             env: Extra environment variables for the command.
             timeout: Deadline in seconds. On expiry the command is killed and an exception
                 deriving from `TimeoutError` is raised.
-            output_limit: Maximum number of output characters to retain per stream (oldest
-                dropped first, reported via `stdout_dropped`/`stderr_dropped`). Implementations
-                that cannot bound output raise `NotImplementedError` when this is set.
+            output_limit: Maximum number of output characters to retain in total across both
+                streams (oldest dropped first, reported via `stdout_dropped`/`stderr_dropped`).
+                Implementations that cannot bound output raise `NotImplementedError` when this
+                is set.
         """
         ...
 

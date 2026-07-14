@@ -102,27 +102,30 @@ class MySandboxCapability(AbstractCapability[Any]):
 
 A capability that shares one **warm sandbox across runs** (state persists between conversations) skips the `wrap_run` teardown entirely and just returns its long-lived handle from `get_sandbox` — nothing will touch it at run end.
 
+!!! warning "`for_run` isolation is not optional for owned sandboxes"
+    The `replace(self)` in `for_run` above is load-bearing: without it, two concurrent runs share one capability instance, and one run's teardown destroys the sandbox the other run is still using (while the first-acquired handle leaks). If your capability owns per-run state of any kind, return a fresh copy from `for_run`.
+
 ### Availability
 
 Where `ctx.sandbox` is non-`None` depends on who supplied it:
 
 | Phase | `run(sandbox=...)` | capability-contributed |
 |---|---|---|
-| `for_run`, metadata factories | ✅ | ❌ |
+| `for_run`, initial metadata factories | ✅ | ❌ |
 | `wrap_run` before `await handler()` | ✅ | ❌ (resolved inside the handler) |
 | `before_run`, instructions, **tool calls**, output validation, event streams | ✅ | ✅ |
 | streamed-result consumption (`run_stream` body) | ✅ | ✅ |
 | `after_run`, `on_run_error`, toolset `__aexit__` | ✅ (caller-owned, still live) | ❌ (cleared) |
 
-A capability-contributed sandbox is **cleared from the context when the run body finishes**, because its owner may destroy it the moment the wrap chain unwinds — hooks that run later see `None` instead of a live-looking dead handle. A toolset that needs the sandbox during its own `__aexit__` should capture the handle during the run.
+A capability-contributed sandbox is **cleared from the context when the run body finishes**, because its owner may destroy it the moment the wrap chain unwinds — hooks that run later see `None` instead of a live-looking dead handle. A toolset that needs the sandbox during its own `__aexit__` should capture the handle during the run. One nuance: metadata factories are evaluated twice, and the *final* re-evaluation (when the run produces a result, just before the run body finishes) still observes a capability-contributed sandbox — only the initial evaluation predates it.
 
 ## Durable execution
 
 A live sandbox handle **does not survive a durable-execution boundary** — this is inherent, not an implementation gap:
 
-- **[Temporal](durable_execution/temporal.md)**: tool bodies run in activities, where `RunContext` is rebuilt from a serialized allowlist; a live handle can't cross, and capability hooks run as workflow code where creating a sandbox (network I/O) is forbidden. Temporal agents therefore **reject** both `run(sandbox=...)` and sandbox-contributing capabilities inside a workflow with a clear error, and `ctx.sandbox` inside an activity raises [`UserError`][pydantic_ai.exceptions.UserError] instead of silently returning `None`.
+- **[Temporal](durable_execution/temporal.md)**: tool bodies run in activities, where `RunContext` is rebuilt from a serialized allowlist; a live handle can't cross, and capability hooks run as workflow code where creating a sandbox (network I/O) is forbidden. Temporal agents therefore **reject** both `run(sandbox=...)` and sandbox-contributing capabilities inside a workflow with a clear error, and `ctx.sandbox` inside an activity raises [`UserError`][pydantic_ai.exceptions.UserError] instead of silently returning `None`. One caveat: the capability check is static, so a *dynamic* capability whose factory only resolves to a sandbox contributor at run time cannot be detected up front — its `get_sandbox` would then execute as workflow code and fail (or worse, break replay determinism) at I/O time. Don't contribute sandboxes from dynamic capabilities in Temporal workflows.
 - **[DBOS](durable_execution/dbos.md)**: run arguments are pickled as workflow inputs, so `run(sandbox=...)` is rejected. Function tools run inline in workflow code, so a *capability-contributed* sandbox does work on the happy path — but on crash recovery the workflow re-executes from the top: the capability acquires a **second** sandbox, the first one's teardown never ran (leaked — give sandboxes a server-side TTL), and inline tools re-execute their side effects against the fresh sandbox while recorded steps replay old results. Prefer a shared sandbox keyed by a stable id (e.g. the DBOS workflow id) over owned-per-run.
-- **[Prefect](durable_execution/prefect.md)**: tool calls are tasks with input-hash caching; the sandbox's identity (`sandbox_id`) participates in the cache key so a flow-run retry with a fresh sandbox can't silently replay results recorded against a dead one.
+- **[Prefect](durable_execution/prefect.md)**: tool calls are tasks with input-hash caching; the sandbox's provider-qualified identity (`provider` + `sandbox_id` — ids are only unique within a provider) participates in the cache key so a flow-run retry with a fresh sandbox can't silently replay results recorded against a dead one.
 
 The pattern that *does* work everywhere: carry a **serializable reference** and re-open the sandbox where the work happens.
 

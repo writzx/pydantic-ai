@@ -77,7 +77,11 @@ class CombinedCapability(AbstractCapability[AgentDepsT]):
 
     @property
     def has_get_sandbox(self) -> bool:
-        return any(c.has_get_sandbox for c in self.capabilities)
+        # A subclass may override `get_sandbox` on the container itself (not just on leaves),
+        # so check both — mirroring `WrapperCapability.has_get_sandbox`.
+        return type(self).get_sandbox is not CombinedCapability.get_sandbox or any(
+            c.has_get_sandbox for c in self.capabilities
+        )
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractCapability[AgentDepsT]:
         new_caps = await gather(*(c.for_run(ctx) for c in self.capabilities))

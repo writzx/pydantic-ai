@@ -189,6 +189,7 @@ nav:
           - api/retries.md
           - api/run.md
           - api/sandbox.md
+          - api/local_sandbox.md
           - api/settings.md
           - api/tools.md
           - api/toolsets.md

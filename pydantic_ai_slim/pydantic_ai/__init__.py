@@ -45,6 +45,7 @@ from .exceptions import (
     UserError,
 )
 from .format_prompt import format_as_xml
+from .local_sandbox import LocalSandbox
 from .messages import (
     AgentStreamEvent,
     AudioFormat,
@@ -312,6 +313,7 @@ __all__ = (
     'AgentCapability',
     'CapabilityFunc',
     # sandbox
+    'LocalSandbox',
     'Sandbox',
     # output
     'ToolOutput',

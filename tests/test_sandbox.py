@@ -273,7 +273,8 @@ async def test_last_capability_in_chain_wins_and_losers_never_acquire():
     first = SandboxCapability(name='first')
     last = SandboxCapability(name='last')
     agent = make_probe_agent(seen, capabilities=[first, last])
-    await agent.run('go')
+    with pytest.warns(UserWarning, match='override `get_sandbox`'):
+        await agent.run('go')
     assert seen == ['last']
     assert not any('get_sandbox' in entry for entry in first.log)
 
@@ -290,7 +291,8 @@ async def test_innermost_ordering_constraint_beats_registration_order():
     pinned = InnermostSandboxCapability(name='pinned-innermost')
     later = SandboxCapability(name='registered-later')
     agent = make_probe_agent(seen, capabilities=[pinned, later])
-    await agent.run('go')
+    with pytest.warns(UserWarning, match='override `get_sandbox`'):
+        await agent.run('go')
     assert seen == ['pinned-innermost']
     assert not any('get_sandbox' in entry for entry in later.log)
 
@@ -306,10 +308,31 @@ async def test_capability_returning_none_falls_back_to_earlier_capability():
     contributor = SandboxCapability(name='contributor')
     abstainer = Abstaining(name='abstainer')
     agent = make_probe_agent(seen, capabilities=[contributor, abstainer])
-    await agent.run('go')
+    with pytest.warns(UserWarning, match='override `get_sandbox`'):
+        await agent.run('go')
     # The later capability was consulted first, returned None, and the earlier one won.
     assert seen == ['contributor']
     assert any('abstainer:get_sandbox' in entry for entry in abstainer.log)
+
+
+async def test_multiple_contributors_warn_once_naming_the_winner_rule():
+    seen: list[str] = []
+    agent = make_probe_agent(seen, capabilities=[SandboxCapability(name='a'), SandboxCapability(name='b')])
+    with pytest.warns(UserWarning) as warnings_record:
+        await agent.run('go')
+    messages = [str(w.message) for w in warnings_record if w.category is UserWarning]
+    assert messages == [
+        '2 capabilities override `get_sandbox`; the one latest in the resolved '
+        'capability chain is consulted first, and earlier ones only when later ones return None'
+    ]
+
+
+async def test_single_contributor_does_not_warn():
+    # `filterwarnings = error` makes any stray warning fail this test.
+    seen: list[str] = []
+    agent = make_probe_agent(seen, capabilities=[SandboxCapability(name='only')])
+    await agent.run('go')
+    assert seen == ['only']
 
 
 async def test_deferred_unloaded_capability_never_contributes():
@@ -488,7 +511,10 @@ async def test_get_sandbox_failure_propagates_and_unwinds():
     failing = Failing(name='failing')
     seen: list[str] = []
     agent = make_probe_agent(seen, capabilities=[outer, failing])
-    with pytest.raises(RuntimeError, match='acquisition failed'):
+    with (
+        pytest.warns(UserWarning, match='override `get_sandbox`'),
+        pytest.raises(RuntimeError, match='acquisition failed'),
+    ):
         await agent.run('go')
 
     # The later-in-chain capability was consulted first and raised; the earlier one was never asked.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from collections.abc import AsyncIterable, Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -217,13 +218,24 @@ class CombinedCapability(AbstractCapability[AgentDepsT]):
         # capability never acquires a sandbox it would immediately have to discard. Deferred
         # capabilities that aren't loaded are skipped: their `wrap_run` never entered, so a
         # sandbox acquired there would have no teardown bracket and would leak.
-        for capability in reversed(self.capabilities):
-            if not capability.has_get_sandbox:
-                continue
-            if (cap_ctx := _ctx_for_available_cap(capability, ctx)) is not None:
-                sandbox = await capability.get_sandbox(cap_ctx)
-                if sandbox is not None:
-                    return sandbox
+        available: list[tuple[AbstractCapability[AgentDepsT], RunContext[AgentDepsT]]] = []
+        for capability in self.capabilities:
+            if capability.has_get_sandbox and (cap_ctx := _ctx_for_available_cap(capability, ctx)) is not None:
+                available.append((capability, cap_ctx))
+        if len(available) > 1:
+            # Detection is side-effect-free (override identity, no hooks fire); the resolution
+            # below stays winner-only. Silent last-wins would make one capability's sandbox
+            # quietly shadow another's — say so once, at the moment it happens.
+            warnings.warn(
+                f'{len(available)} capabilities override `get_sandbox`; the one latest in the resolved '
+                'capability chain is consulted first, and earlier ones only when later ones return None',
+                UserWarning,
+                stacklevel=2,
+            )
+        for capability, cap_ctx in reversed(available):
+            sandbox = await capability.get_sandbox(cap_ctx)
+            if sandbox is not None:
+                return sandbox
         return None
 
     # --- Tool preparation hooks ---

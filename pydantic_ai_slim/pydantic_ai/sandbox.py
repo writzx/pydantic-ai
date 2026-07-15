@@ -183,7 +183,7 @@ class SandboxFilesystem(Protocol):
         ...
 
     async def write_bytes(self, path: str, data: bytes) -> None:
-        """Write bytes to a file, replacing any existing contents."""
+        """Write bytes to a file, creating missing parent directories and replacing existing contents."""
         ...
 
     async def read_text(self, path: str, encoding: str = 'utf-8') -> str:
@@ -191,7 +191,7 @@ class SandboxFilesystem(Protocol):
         ...
 
     async def write_text(self, path: str, content: str, encoding: str = 'utf-8') -> None:
-        """Write text to a file, replacing any existing contents."""
+        """Write text to a file, creating missing parent directories and replacing existing contents."""
         ...
 
     async def stat(self, path: str) -> SandboxFileEntry:

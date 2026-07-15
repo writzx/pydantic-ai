@@ -2,7 +2,7 @@
 
 Agents that write files and run commands need somewhere to do it that isn't your machine's bare filesystem and shell. A **sandbox** is an isolated execution environment — a subprocess jail, a container, a microVM, a remote worker — attached to an agent run: tools and capabilities reach it through the readonly [`RunContext.sandbox`][pydantic_ai.tools.RunContext.sandbox] field, execute commands in it, and read and write its files.
 
-Pydantic AI defines the **concept, not an implementation**: [`Sandbox`][pydantic_ai.sandbox.Sandbox] is a [structural protocol](https://typing.python.org/en/latest/spec/protocol.html), so any object with the right surface conforms — no base class, no registration, no dependency on any particular sandboxing library. Wire up a Docker container, a cloud sandbox SDK, or the ~one-page local shim [below](#a-minimal-local-implementation).
+Pydantic AI defines the **concept, not an implementation**: [`Sandbox`][pydantic_ai.sandbox.Sandbox] is a [structural protocol](https://typing.python.org/en/latest/spec/protocol.html), so any object with the right surface conforms — no base class, no registration, no dependency on any particular sandboxing library. Wire up a Docker container or a cloud sandbox SDK — or start with the shipped, isolation-free [`LocalSandbox`][pydantic_ai.local_sandbox.LocalSandbox] ([below](#a-minimal-local-implementation)).
 
 ## The protocol
 
@@ -54,7 +54,7 @@ async with make_docker_sandbox() as sandbox:  # any Sandbox-conforming object
 agent = Agent('anthropic:claude-sonnet-5', capabilities=[MySandboxCapability()])
 ```
 
-A sandbox passed to the run method **wins** over anything a capability would contribute — the capability hooks are then never invoked, exactly like run-level `model_settings` beating capability settings. Among capabilities, the one **latest in the resolved chain** wins (with no [ordering constraints][pydantic_ai.capabilities.CapabilityOrdering] in play, that's the last one registered); earlier capabilities are only consulted if it returns `None`, and deferred capabilities that haven't been loaded never contribute.
+A sandbox passed to the run method **wins** over anything a capability would contribute — the capability hooks are then never invoked, exactly like run-level `model_settings` beating capability settings. Among capabilities, the one **latest in the resolved chain** wins (with no [ordering constraints][pydantic_ai.capabilities.CapabilityOrdering] in play, that's the last one registered); earlier capabilities are only consulted if it returns `None`, and deferred capabilities that haven't been loaded never contribute. When more than one capability overrides `get_sandbox`, Pydantic AI emits a `UserWarning` naming this winner rule — a silently shadowed sandbox is a debugging trap.
 
 ## Lifecycle: whoever supplies it, owns it
 
@@ -165,7 +165,20 @@ Re-opening by `sandbox_id` inside each tool call is exactly why the protocol req
 
 ## A minimal local implementation
 
-The protocol floor is deliberately small — a local implementation over `asyncio.subprocess` and `pathlib` fits on a page. Suitable for trusted workloads and tests; it isolates nothing.
+Pydantic AI ships one batteries-included implementation, [`LocalSandbox`][pydantic_ai.local_sandbox.LocalSandbox]: host subprocesses and the host filesystem behind the protocol surface. It **isolates nothing** — use it for trusted workloads, tests, and development, and swap in a real sandbox for anything else. POSIX only; construction raises `NotImplementedError` elsewhere:
+
+```python {test="skip"}
+from pydantic_ai import Agent, LocalSandbox
+
+agent = Agent('anthropic:claude-sonnet-5')
+
+
+async def main() -> None:
+    async with LocalSandbox() as sandbox:  # a temp directory, removed on exit
+        await agent.run('Write fizzbuzz to fizzbuzz.py and run it.', sandbox=sandbox)
+```
+
+It is also the reference for implementing the protocol yourself: the floor is deliberately small — a local implementation over `asyncio.subprocess` and `pathlib` fits on a page.
 
 ```python {title="local_sandbox.py" test="skip"}
 import asyncio
@@ -202,7 +215,11 @@ class LocalFilesystem:
         return await asyncio.to_thread(Path(path).read_bytes)
 
     async def write_bytes(self, path: str, data: bytes) -> None:
-        await asyncio.to_thread(Path(path).write_bytes, data)
+        def write() -> None:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)  # the write contract creates parents
+            Path(path).write_bytes(data)
+
+        await asyncio.to_thread(write)
 
     async def read_text(self, path: str, encoding: str = 'utf-8') -> str:
         return (await self.read_bytes(path)).decode(encoding)
@@ -275,10 +292,10 @@ class LocalSandbox:
             )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError) as e:  # asyncio's is distinct on 3.10
             proc.kill()  # the contract: a timeout kills the command...
             await proc.wait()
-            raise  # ...and raises a TimeoutError subclass
+            raise TimeoutError(f'command timed out after {timeout} seconds') from e  # ...as a builtin TimeoutError
         return LocalResult(proc.returncode or 0, stdout.decode(), stderr.decode())
 
     async def start(self, command, **kwargs):

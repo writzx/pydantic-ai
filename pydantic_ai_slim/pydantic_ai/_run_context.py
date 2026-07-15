@@ -35,7 +35,7 @@ RunContextAgentDepsT = TypeVar('RunContextAgentDepsT', default=object, covariant
 
 @dataclasses.dataclass
 class SandboxHolder:
-    """Internal one-slot carrier for a run's sandbox — not part of the public API.
+    """Internal carrier for a run's sandbox slot and its provenance — not part of the public API.
 
     Created once per run and shared by reference into every `RunContext` built for the run
     (like `_mcp_tool_defs_cache`), so the readonly `RunContext.sandbox` property observes the
@@ -46,7 +46,15 @@ class SandboxHolder:
     """
 
     value: Sandbox | None = None
+    """The run's sandbox; `None` before one is contributed and after run-body-exit clearing."""
     from_capability: bool = False
+    """Whether `value` came from a capability's `get_sandbox` rather than the `sandbox=` run argument.
+
+    This provenance gates the clearing at run-body exit: a capability-contributed sandbox may
+    be torn down by its capability's `wrap_run` `finally` the moment the run body returns, so
+    the slot must be emptied before the wrap chain unwinds; a run-argument sandbox is
+    caller-owned, outlives the run, and stays.
+    """
 
 
 @dataclasses.dataclass(repr=False, kw_only=True)

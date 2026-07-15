@@ -355,7 +355,10 @@ class AbstractCapability(ABC, Generic[AgentDepsT]):
         runs, just return the long-lived handle. The framework never creates, enters, or
         destroys sandboxes; it clears a capability-contributed sandbox from
         [`RunContext.sandbox`][pydantic_ai.tools.RunContext.sandbox] when the run body
-        finishes, before `after_run`/`on_run_error` and toolset `__aexit__` run.
+        finishes, before `after_run`/`on_run_error` and toolset `__aexit__` run. That
+        clearing also precedes your own `wrap_run`'s `finally`, so don't reach for
+        `ctx.sandbox` at teardown — keep your own reference to what you return here (the
+        exit-stack pattern above does this naturally).
         """
         return None
 

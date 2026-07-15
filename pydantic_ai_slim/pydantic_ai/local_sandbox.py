@@ -36,11 +36,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn
 
 from typing_extensions import Self
 
 from .sandbox import SandboxCommand
+
+if TYPE_CHECKING:
+    from .sandbox import Sandbox
 
 __all__ = ('LocalSandbox',)
 
@@ -119,7 +122,11 @@ class _LocalFilesystem:
 
 
 class LocalSandbox:
-    """The sandbox protocol over host subprocesses and the host filesystem. Isolates nothing.
+    """[`Sandbox`][pydantic_ai.sandbox.Sandbox] over host subprocesses and the host filesystem. Isolates nothing.
+
+    Implements the protocol *structurally* — deliberately no base class, like any
+    third-party implementation. Conformance is pinned by the type-checked assignment at
+    the bottom of this module.
 
     Args:
         root: The working directory commands run in and relative paths resolve against.
@@ -244,3 +251,10 @@ class LocalSandbox:
         output_limit: int | None = None,
     ) -> NoReturn:
         raise NotImplementedError('LocalSandbox only supports run(); use timeout= to bound commands.')
+
+
+if TYPE_CHECKING:
+    # LocalSandbox satisfies the Sandbox protocol structurally; this assignment makes the
+    # type checker verify full conformance — signatures included — which a
+    # `@runtime_checkable` isinstance check cannot.
+    _conforms: Sandbox = LocalSandbox()

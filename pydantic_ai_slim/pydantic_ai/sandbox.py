@@ -19,6 +19,14 @@ richer surfaces (reconnection, snapshotting, streaming limits, provider-native e
 on their concrete types. Code written against the protocol must only rely on what is
 documented here.
 
+Every type in this module — including the plain data carriers
+[`SandboxResult`][pydantic_ai.sandbox.SandboxResult],
+[`SandboxOutputChunk`][pydantic_ai.sandbox.SandboxOutputChunk], and
+[`SandboxFileEntry`][pydantic_ai.sandbox.SandboxFileEntry] — is a protocol rather than a
+concrete class for the same reason: a sandbox library's existing native types conform as-is,
+so attaching one requires no pydantic-ai dependency, no adapter layer, and no lossy copy of
+richer provider objects into pydantic-ai ones.
+
 Contracts every implementation must honor:
 
 - **Optional operations raise `NotImplementedError`.** Not every backend can stream output,
@@ -53,7 +61,7 @@ __all__ = (
     'SandboxResult',
 )
 
-SandboxCommand: TypeAlias = 'str | Sequence[str]'
+SandboxCommand: TypeAlias = str | Sequence[str]
 """A command to execute in a sandbox.
 
 Either an argv sequence (`['python', '-c', 'print(1)']`), or — with `shell=True` — a shell
@@ -65,8 +73,9 @@ callers to be explicit about shell interpretation.
 class SandboxResult(Protocol):
     """The result of a completed command execution.
 
-    Structural: any object carrying these attributes conforms; implementations are free to
-    return richer concrete types.
+    A protocol rather than a concrete class so implementations return their native result
+    objects unwrapped: any object carrying these attributes conforms, and richer provider
+    fields survive for callers that know the concrete type.
     """
 
     @property
@@ -96,7 +105,11 @@ class SandboxResult(Protocol):
 
 
 class SandboxOutputChunk(Protocol):
-    """A chunk of live output from a started process."""
+    """A chunk of live output from a started process.
+
+    Structural, like [`SandboxResult`][pydantic_ai.sandbox.SandboxResult]: implementations
+    yield their native chunk types.
+    """
 
     @property
     def stream(self) -> Literal['stdout', 'stderr']:
@@ -110,7 +123,11 @@ class SandboxOutputChunk(Protocol):
 
 
 class SandboxFileEntry(Protocol):
-    """Metadata about a file or directory inside the sandbox."""
+    """Metadata about a file or directory inside the sandbox.
+
+    Structural, like [`SandboxResult`][pydantic_ai.sandbox.SandboxResult]: implementations
+    return their native entry types.
+    """
 
     @property
     def name(self) -> str:
@@ -224,6 +241,13 @@ class Sandbox(Protocol):
     implementations must honor, and the [sandbox documentation](../sandbox.md) for lifecycle
     rules: this protocol deliberately contains no create/destroy/connect surface, because the
     supplier of a sandbox always owns its lifecycle.
+
+    This is the module's only `@runtime_checkable` protocol, because it is the boundary
+    object handed to `sandbox=` and worth an `isinstance` sanity check there. Such checks are
+    shallow — they verify member *presence*, not signatures or member types (`isinstance`
+    can't see that `fs` is a proper [`SandboxFilesystem`][pydantic_ai.sandbox.SandboxFilesystem]),
+    so decorating the inner protocols would add nothing: full conformance is the type
+    checker's job. Verify it statically, e.g. `sandbox: Sandbox = MySandbox(...)`.
     """
 
     @property

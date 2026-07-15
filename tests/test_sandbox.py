@@ -371,8 +371,12 @@ async def test_sandbox_identity_stable_across_steps():
 
 
 async def test_capability_sandbox_cleared_before_toolset_exit():
-    """Capability teardown (wrap_run finally) runs before toolset __aexit__, so the toolset
-    must see `None` — never a live-looking destroyed handle."""
+    """Capability teardown (wrap_run finally) runs before toolset __aexit__, so a toolset must
+    never observe a live-looking destroyed handle at exit. Today that holds trivially: the
+    ambient run context is token-scoped to node execution and is already unset by toolset exit.
+    This pin exists so that if the ambient context ever *does* become available there, the
+    change trips this test and the author must show `ctx.sandbox` is `None` (cleared), not the
+    dead capability sandbox."""
     exit_observations: list[str] = []
 
     class Observing(WrapperToolset[Any]):
@@ -396,7 +400,7 @@ async def test_capability_sandbox_cleared_before_toolset_exit():
         capabilities=[SandboxCapability(name='cap')],
     )
     await agent.run('go')
-    assert exit_observations in (['none'], ['no-ctx'])  # cleared (or no ambient ctx) — never 'cap'
+    assert exit_observations == ['no-ctx']  # if this becomes 'none', fine; 'cap' would be the bug
 
 
 async def test_on_run_error_sees_cleared_sandbox():

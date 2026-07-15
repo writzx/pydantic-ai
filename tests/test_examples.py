@@ -256,7 +256,7 @@ def test_docs_examples(
     # `from bank_database import DatabaseConn` wrongly sorted in imports
     # waiting for https://github.com/pydantic/pytest-examples/issues/43
     # and https://github.com/pydantic/pytest-examples/issues/46
-    if 'import DatabaseConn' in example.source:
+    if 'import DatabaseConn' in example.source or 'from my_sandboxes import' in example.source:
         ruff_ignore.append('I001')
 
     if noqa:
@@ -838,6 +838,10 @@ async def model_logic(  # noqa: C901
                     FilePart(content=BinaryImage(data=b'fake', media_type='image/png', identifier='160d47')),
                 ]
             )
+        elif m.content == 'Write fizzbuzz to fizzbuzz.py and run it.':
+            return ModelResponse(parts=[TextPart('fizzbuzz.py is written and runs clean.')])
+        elif m.content == 'Profile the script and fix the hot spot.':
+            return ModelResponse(parts=[TextPart('Optimized the hot loop; the profile is clean now.')])
         elif m.content == 'Calculate the factorial of 15.':
             return ModelResponse(
                 parts=[

@@ -6,10 +6,11 @@ It exists so the sandbox concept works out of the box for trusted workloads, tes
 development, and doubles as the reference for implementing the protocol: the whole thing
 is one page over `asyncio.subprocess`.
 
-```python {test="skip"}
+```python
 from pydantic_ai import Agent, LocalSandbox
 
 agent = Agent('anthropic:claude-sonnet-5')
+
 
 async def main() -> None:
     async with LocalSandbox() as sandbox:  # a temporary directory, removed on exit
@@ -97,8 +98,12 @@ class _LocalFilesystem:
             entries: list[_LocalFileEntry] = []
             for child in sorted(Path(path).iterdir()):
                 is_dir = child.is_dir()
-                # lstat: a broken symlink in the directory must not fail the whole listing.
-                size = None if is_dir else child.lstat().st_size
+                try:
+                    # stat, not lstat: a symlinked file reports its target's size, matching `stat()`.
+                    size = None if is_dir else child.stat().st_size
+                except OSError:
+                    # A broken symlink in the directory must not fail the whole listing.
+                    size = None
                 entries.append(_LocalFileEntry(name=child.name, path=str(child), is_dir=is_dir, size=size))
             return entries
 
@@ -220,9 +225,15 @@ class LocalSandbox:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout)
         except (TimeoutError, asyncio.TimeoutError) as error:  # asyncio's is distinct on 3.10
             # The contract: a timeout kills the command and raises a TimeoutError subclass.
-            self._kill(process)
-            await process.wait()
             raise TimeoutError(f'command timed out after {timeout} seconds and was killed') from error
+        finally:
+            # One teardown covers every exit path — timeout, cancellation of the awaiting
+            # task, any other failure: if `communicate()` didn't complete, the process is
+            # still running and the whole group is killed. The kill guarantee would be
+            # broken if it only applied to timeouts.
+            if process.returncode is None:
+                self._kill(process)
+                await process.wait()
         assert process.returncode is not None
         return _LocalResult(
             exit_code=process.returncode,
@@ -232,13 +243,15 @@ class LocalSandbox:
 
     @staticmethod
     def _kill(process: asyncio.subprocess.Process) -> None:
+        # `start_new_session=True` made the child the leader of a fresh group we own, and
+        # until the child is reaped its pgid cannot be reused — so "already exited" is the
+        # only benign failure here. Anything else (e.g. a hardened host denying `killpg`)
+        # means the kill guarantee is broken: raise rather than degrade to `process.kill()`,
+        # which signals only the direct child and would leave grandchildren running.
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):  # pragma: no cover - already gone, or restricted host
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
+        except ProcessLookupError:
+            pass
 
     async def start(
         self,

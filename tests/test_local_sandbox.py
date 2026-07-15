@@ -69,6 +69,40 @@ async def test_timeout_kills_the_whole_process_group_and_raises(tmp_path: Path):
     assert not marker.exists()
 
 
+async def test_cancellation_kills_the_whole_process_group(tmp_path: Path):
+    """The kill guarantee is not timeout-only: cancelling the awaiting task (an outer
+    `asyncio.wait_for`, a durable runner aborting, a user breaking out of `iter()`) must
+    also tear down the process group instead of leaking it."""
+    sandbox = LocalSandbox(tmp_path)
+    pid_file = tmp_path / 'pid'
+    task = asyncio.create_task(sandbox.run(f'echo $$ > {pid_file}; sleep 30', shell=True))
+    while not pid_file.exists() or not pid_file.read_text().strip():
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    group = int(pid_file.read_text())  # `$$` is the shell's pid == the group it leads
+    for _ in range(200):
+        try:
+            os.killpg(group, 0)
+        except ProcessLookupError:
+            break  # every member (shell and its `sleep` child) is gone
+        await asyncio.sleep(0.01)
+    else:
+        os.killpg(group, 9)
+        pytest.fail('the process group survived cancellation')
+
+
+async def test_kill_tolerates_an_already_exited_group():
+    """A command can finish in the instant between the deadline firing and the kill; the
+    only benign `killpg` failure is "already exited". Unreachable deterministically through
+    `run()` (it's a race), so the teardown helper is pinned directly."""
+    process = await asyncio.create_subprocess_exec('true', start_new_session=True)
+    await process.wait()
+    LocalSandbox._kill(process)  # pyright: ignore[reportPrivateUsage]
+
+
 async def test_env_overlays_the_host_environment(tmp_path: Path):
     sandbox = LocalSandbox(tmp_path)
     result = await sandbox.run('echo "$GREETING:$PATH"', shell=True, env={'GREETING': 'hi'})
@@ -126,6 +160,20 @@ async def test_filesystem_round_trip_with_parent_creation(tmp_path: Path):
     assert not await sandbox.fs.exists(blob)
     with pytest.raises(FileNotFoundError):
         await sandbox.fs.read_bytes(blob)
+
+
+async def test_list_dir_symlink_sizes_match_stat(tmp_path: Path):
+    """A symlinked file reports its target's size (as `stat` does); a broken symlink
+    doesn't fail the listing, it just has no size."""
+    sandbox = LocalSandbox(tmp_path)
+    (tmp_path / 'target.txt').write_text('12345')
+    (tmp_path / 'link.txt').symlink_to(tmp_path / 'target.txt')
+    (tmp_path / 'broken.txt').symlink_to(tmp_path / 'missing.txt')
+
+    entries = {entry.name: entry for entry in await sandbox.fs.list_dir(str(tmp_path))}
+    assert entries['link.txt'].size == 5
+    assert entries['link.txt'].size == (await sandbox.fs.stat(str(tmp_path / 'link.txt'))).size
+    assert entries['broken.txt'].size is None
 
 
 async def test_unused_default_sandbox_creates_no_directory():

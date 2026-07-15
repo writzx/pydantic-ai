@@ -17,7 +17,12 @@ and how sandboxes interact with durable execution.
 The protocol is deliberately a floor, not a ceiling: implementations are expected to offer
 richer surfaces (reconnection, snapshotting, streaming limits, provider-native escape hatches)
 on their concrete types. Code written against the protocol must only rely on what is
-documented here.
+documented here. The floor is also frozen once released: because conformance is structural,
+adding a member to any protocol in this module silently breaks every existing implementation,
+which stops conforming the moment the member it lacks appears — documenting the new member as
+optional-may-raise-`NotImplementedError` doesn't help, since it must still *exist* to
+typecheck. New operations must therefore arrive on concrete types or as new, separate
+protocols, never as members of these.
 
 Every type in this module — including the plain data carriers
 [`SandboxResult`][pydantic_ai.sandbox.SandboxResult],
@@ -44,6 +49,10 @@ Contracts every implementation must honor:
 - **Results are honest.** `exit_code` is the real process exit code; a non-zero exit is a
   normal result, not an exception. Infrastructure failures raise; they are never disguised as
   fake exit codes or empty output.
+- **Command/shell mismatches raise `TypeError`.** A `str` command without `shell=True`, or an
+  argv sequence with it, must be rejected with a `TypeError` — never shell-interpreted or
+  joined by guesswork. Since `str` is itself a `Sequence[str]`, the type checker cannot catch
+  the mismatch; this runtime rejection is what keeps it from becoming an injection vector.
 - **The protocol is not a security boundary.** Isolation comes from the environment the
   implementation provides; [`resolve`][pydantic_ai.sandbox.Sandbox.resolve] is a textual
   convenience that does not confine paths.
@@ -68,8 +77,9 @@ SandboxCommand: TypeAlias = str | Sequence[str]
 """A command to execute in a sandbox.
 
 Either an argv sequence (`['python', '-c', 'print(1)']`), or — with `shell=True` — a shell
-string (`'echo $HOME | wc -c'`). Passing a `str` without `shell=True` is invalid: it forces
-callers to be explicit about shell interpretation.
+string (`'echo $HOME | wc -c'`). Passing a `str` without `shell=True` is invalid, and so is
+an argv sequence with `shell=True`: implementations must reject either mismatch with a
+`TypeError`, forcing callers to be explicit about shell interpretation.
 """
 
 

@@ -343,7 +343,10 @@ class AbstractCapability(ABC, Generic[AgentDepsT]):
         When multiple capabilities override this hook, the one **latest in the resolved
         capability chain** is consulted first and its non-`None` result wins (with no
         ordering constraints in play, that is the last-registered capability); earlier
-        capabilities are only consulted if it returns `None`. Capabilities with
+        capabilities are only consulted if it returns `None`. Because a silently shadowed
+        sandbox is a debugging trap, an agent whose resolved chain contains more than one
+        override of this hook emits a `UserWarning` naming this rule at run time.
+        Capabilities with
         [`defer_loading`][pydantic_ai.capabilities.AbstractCapability.defer_loading] that
         haven't been loaded are skipped entirely.
 

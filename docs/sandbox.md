@@ -8,7 +8,7 @@ Pydantic AI defines the **concept, not an implementation**: [`Sandbox`][pydantic
 
 A sandbox exposes two things: **command execution** and **file access**.
 
-```python {test="skip"}
+```python
 from pydantic_ai.sandbox import Sandbox
 
 
@@ -22,7 +22,7 @@ async def analyze(sandbox: Sandbox) -> str:
 
 | Member | What it does |
 |---|---|
-| [`run(command, ...)`][pydantic_ai.sandbox.Sandbox.run] | Execute an argv sequence (or, with `shell=True`, a shell string) and wait for the [result][pydantic_ai.sandbox.SandboxResult]. |
+| [`run(command, ...)`][pydantic_ai.sandbox.Sandbox.run] | Execute an argv sequence (or, with `shell=True`, a shell string — a mismatch raises `TypeError`) and wait for the [result][pydantic_ai.sandbox.SandboxResult]. |
 | [`start(command, ...)`][pydantic_ai.sandbox.Sandbox.start] | Start a command and return a [`SandboxProcess`][pydantic_ai.sandbox.SandboxProcess] with `wait()`, `stream()`, and `kill()`. |
 | [`fs`][pydantic_ai.sandbox.Sandbox.fs] | A [`SandboxFilesystem`][pydantic_ai.sandbox.SandboxFilesystem]: `read_bytes`/`write_bytes`, `read_text`/`write_text`, `stat`, `list_dir`, `make_dir`, `remove`, `exists`. |
 | [`working_dir()`][pydantic_ai.sandbox.Sandbox.working_dir] / [`resolve(path)`][pydantic_ai.sandbox.Sandbox.resolve] | The default working directory, and a helper to make model-supplied relative paths absolute. |
@@ -39,18 +39,32 @@ Three contracts to know when writing code against the protocol (implementers: se
 
 ## Attaching a sandbox to a run
 
-There are two routes, mirroring how [model settings](agents.md#model-run-settings) layer:
+There are two routes, mirroring how [model settings](agent.md#model-run-settings) layer:
 
 **1. Directly, per run** — you create it, you own it:
 
-```python {test="skip" lint="skip"}
-async with make_docker_sandbox() as sandbox:  # any Sandbox-conforming object
-    result = await agent.run('Profile the script and fix the hot spot.', sandbox=sandbox)
+```python
+from my_sandboxes import make_docker_sandbox  # your sandbox library
+
+from pydantic_ai import Agent
+
+agent = Agent('anthropic:claude-sonnet-5')
+
+
+async def main() -> None:
+    async with make_docker_sandbox() as sandbox:  # any Sandbox-conforming object
+        result = await agent.run('Profile the script and fix the hot spot.', sandbox=sandbox)
+        print(result.output)
+        #> Optimized the hot loop; the profile is clean now.
 ```
 
-**2. From a capability** — the capability manages acquisition and teardown via the [`get_sandbox`][pydantic_ai.capabilities.AbstractCapability.get_sandbox] hook, so agent code stays a one-liner:
+**2. From a capability** — the capability manages acquisition and teardown via the [`get_sandbox`][pydantic_ai.capabilities.AbstractCapability.get_sandbox] hook ([defined below](#lifecycle-whoever-supplies-it-owns-it)), so agent code stays a one-liner:
 
-```python {test="skip" lint="skip"}
+```python {requires="sandbox_capability.py"}
+from pydantic_ai import Agent
+
+from sandbox_capability import MySandboxCapability
+
 agent = Agent('anthropic:claude-sonnet-5', capabilities=[MySandboxCapability()])
 ```
 
@@ -63,7 +77,7 @@ Pydantic AI **never creates, enters, closes, or destroys a sandbox**. It only ca
 - `run(..., sandbox=...)`: the caller owns it. Create it before the run, tear it down after (typically an `async with` around the run).
 - `get_sandbox`: the contributing capability owns it. The hook fires *inside the run body*, after every capability's [`wrap_run`][pydantic_ai.capabilities.AbstractCapability.wrap_run] has entered — so the canonical per-run pattern acquires in `get_sandbox` and tears down in `wrap_run`'s `finally`:
 
-```python {title="sandbox_capability.py" test="skip"}
+```python {title="sandbox_capability.py"}
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field, replace
@@ -129,7 +143,7 @@ A live sandbox handle **does not survive a durable-execution boundary** — this
 
 The pattern that *does* work everywhere: carry a **serializable reference** and re-open the sandbox where the work happens.
 
-```python {title="durable_sandbox_pattern.py" test="skip"}
+```python {title="durable_sandbox_pattern.py"}
 from dataclasses import dataclass
 
 from my_sandboxes import open_sandbox  # worker-side factory holding the credentials
@@ -167,7 +181,7 @@ Re-opening by `sandbox_id` inside each tool call is exactly why the protocol req
 
 Pydantic AI ships one batteries-included implementation, [`LocalSandbox`][pydantic_ai.local_sandbox.LocalSandbox]: host subprocesses and the host filesystem behind the protocol surface. It **isolates nothing** — use it for trusted workloads, tests, and development, and swap in a real sandbox for anything else. POSIX only; construction raises `NotImplementedError` elsewhere:
 
-```python {test="skip"}
+```python
 from pydantic_ai import Agent, LocalSandbox
 
 agent = Agent('anthropic:claude-sonnet-5')
@@ -178,148 +192,22 @@ async def main() -> None:
         await agent.run('Write fizzbuzz to fizzbuzz.py and run it.', sandbox=sandbox)
 ```
 
-It is also the reference for implementing the protocol yourself: the floor is deliberately small — a local implementation over `asyncio.subprocess` and `pathlib` fits on a page.
+It is also the reference for implementing the protocol yourself: the floor is deliberately small — [its source][pydantic_ai.local_sandbox.LocalSandbox] is one page over `asyncio.subprocess` and `pathlib`, and most of that page is spent honoring the contracts rather than filling in the surface: the process-group kill behind the `timeout=` guarantee, `env=` overlaying the host environment instead of replacing it, `TypeError` on command/shell mismatches, and honest `NotImplementedError`s for what it can't do. Implement the same surface over whatever backend you have, and let the type checker verify conformance — a single assignment is the whole "registration" story:
 
-```python {title="local_sandbox.py" test="skip"}
-import asyncio
-import posixpath
-import shutil
-import uuid
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from pathlib import Path
-
-
-@dataclass(frozen=True)
-class LocalResult:
-    exit_code: int
-    stdout: str
-    stderr: str
-    stdout_dropped: int = 0
-    stderr_dropped: int = 0
-
-
-@dataclass(frozen=True)
-class LocalFileEntry:
-    name: str
-    path: str
-    is_dir: bool
-    size: int | None
-
-
-class LocalFilesystem:
-    def __init__(self, root: Path):
-        self._root = root
-
-    async def read_bytes(self, path: str) -> bytes:
-        return await asyncio.to_thread(Path(path).read_bytes)
-
-    async def write_bytes(self, path: str, data: bytes) -> None:
-        def write() -> None:
-            Path(path).parent.mkdir(parents=True, exist_ok=True)  # the write contract creates parents
-            Path(path).write_bytes(data)
-
-        await asyncio.to_thread(write)
-
-    async def read_text(self, path: str, encoding: str = 'utf-8') -> str:
-        return (await self.read_bytes(path)).decode(encoding)
-
-    async def write_text(self, path: str, content: str, encoding: str = 'utf-8') -> None:
-        await self.write_bytes(path, content.encode(encoding))
-
-    async def stat(self, path: str) -> LocalFileEntry:
-        p = Path(path)
-        st = await asyncio.to_thread(p.stat)
-        return LocalFileEntry(p.name, path, p.is_dir(), None if p.is_dir() else st.st_size)
-
-    async def list_dir(self, path: str) -> list[LocalFileEntry]:
-        return [await self.stat(str(child)) for child in sorted(Path(path).iterdir())]
-
-    async def make_dir(self, path: str) -> None:
-        await asyncio.to_thread(Path(path).mkdir, parents=True, exist_ok=True)
-
-    async def remove(self, path: str) -> None:
-        p = Path(path)
-        await asyncio.to_thread(shutil.rmtree, p) if p.is_dir() else await asyncio.to_thread(p.unlink)
-
-    async def exists(self, path: str) -> bool:
-        return await asyncio.to_thread(Path(path).exists)
-
-
-class LocalSandbox:
-    provider = 'local'
-
-    def __init__(self, root: Path):
-        self._root = root
-        self._id = f'local-{uuid.uuid4().hex[:8]}'
-        self.fs = LocalFilesystem(root)
-
-    @property
-    def sandbox_id(self) -> str:
-        return self._id
-
-    async def working_dir(self) -> str:
-        return str(self._root)
-
-    async def resolve(self, path: str, *, base: str | None = None) -> str:
-        if posixpath.isabs(path):
-            return posixpath.normpath(path)
-        return posixpath.normpath(posixpath.join(base or str(self._root), path))
-
-    async def run(
-        self,
-        command: str | Sequence[str],
-        *,
-        shell: bool = False,
-        cwd: str | None = None,
-        env: Mapping[str, str] | None = None,
-        timeout: float | None = None,
-        output_limit: int | None = None,
-    ) -> LocalResult:
-        if output_limit is not None:
-            raise NotImplementedError('LocalSandbox does not bound output; bound it in-command, e.g. `| tail -c`.')
-        if shell:
-            assert isinstance(command, str)
-            proc = await asyncio.create_subprocess_shell(
-                command, cwd=cwd or self._root, env=dict(env) if env else None,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-        else:
-            assert not isinstance(command, str), 'string commands require shell=True'
-            proc = await asyncio.create_subprocess_exec(
-                *command, cwd=cwd or self._root, env=dict(env) if env else None,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
-        except (TimeoutError, asyncio.TimeoutError) as e:  # asyncio's is distinct on 3.10
-            proc.kill()  # the contract: a timeout kills the command...
-            await proc.wait()
-            raise TimeoutError(f'command timed out after {timeout} seconds') from e  # ...as a builtin TimeoutError
-        return LocalResult(proc.returncode or 0, stdout.decode(), stderr.decode())
-
-    async def start(self, command, **kwargs):
-        raise NotImplementedError('LocalSandbox only supports run(); use timeout= to bound commands.')
-```
-
-Verify conformance statically — this is the whole "registration" story:
-
-```python {test="skip" requires="local_sandbox.py"}
-from pathlib import Path
+```python
+from my_sandboxes import DockerSandbox  # any object with the right surface
 
 from pydantic_ai.sandbox import Sandbox
 
-from local_sandbox import LocalSandbox
-
-sandbox: Sandbox = LocalSandbox(Path('/tmp/agent-workspace'))  # type-checked structurally
+sandbox: Sandbox = DockerSandbox(image='python:3.13')  # type-checked structurally
 ```
 
 ## Building tools on the sandbox
 
 The framework attaches the sandbox but ships no sandbox tools: what to expose (`execute`? `read_file`? approval gates? output truncation policy?) is an application decision. A tool reads `ctx.sandbox` and goes:
 
-```python {test="skip"}
-from pydantic_ai import Agent, RunContext
+```python
+from pydantic_ai import Agent, RunContext, UserError
 
 agent = Agent('anthropic:claude-sonnet-5')
 
@@ -328,7 +216,11 @@ agent = Agent('anthropic:claude-sonnet-5')
 async def execute(ctx: RunContext[None], command: str, timeout: float = 30.0) -> str:
     """Run a shell command in the workspace."""
     sandbox = ctx.sandbox
-    assert sandbox is not None, 'attach a sandbox to the run or register a sandbox capability'
+    if sandbox is None:
+        raise UserError(
+            'No sandbox on this run: pass `sandbox=` to the run method '
+            'or register a sandbox-contributing capability.'
+        )
     result = await sandbox.run(command, shell=True, timeout=min(timeout, 120.0))
     output = result.stdout + (f'\n[stderr]\n{result.stderr}' if result.stderr else '')
     return output if result.exit_code == 0 else f'[exit code: {result.exit_code}]\n{output}'

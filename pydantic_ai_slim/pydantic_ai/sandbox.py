@@ -25,7 +25,10 @@ Every type in this module — including the plain data carriers
 [`SandboxFileEntry`][pydantic_ai.sandbox.SandboxFileEntry] — is a protocol rather than a
 concrete class for the same reason: a sandbox library's existing native types conform as-is,
 so attaching one requires no pydantic-ai dependency, no adapter layer, and no lossy copy of
-richer provider objects into pydantic-ai ones.
+richer provider objects into pydantic-ai ones. The carriers declare their members as
+*read-only properties* deliberately: a bare annotated protocol member demands a settable
+attribute, which frozen dataclasses and properties fail to satisfy — declared read-only,
+plain attributes, dataclass fields (frozen included), and properties all conform.
 
 Contracts every implementation must honor:
 

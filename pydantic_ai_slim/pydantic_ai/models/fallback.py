@@ -4,8 +4,8 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from copy import copy
 from dataclasses import dataclass, field, replace
-from decimal import Decimal
 from datetime import datetime
+from decimal import Decimal
 from functools import cached_property
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, NoReturn, TypeGuard
@@ -17,7 +17,7 @@ from typing_extensions import assert_never
 
 from pydantic_ai._instrumentation import model_attributes, model_request_parameters_attributes
 from pydantic_ai._run_context import RunContext
-from pydantic_ai._utils import await_maybe, get_first_param_type, now_utc as _now_utc
+from pydantic_ai._utils import await_maybe, get_first_param_type
 
 from .._genai_prices import fill_response_cost
 from ..exceptions import FallbackExceptionGroup, ModelAPIError, UserError
@@ -111,6 +111,7 @@ class _FallbackStreamedResponse(StreamedResponse):
             model = self._models[self._next_model_index]
             self._next_model_index += 1
 
+            prepared_parameters = self._request_args.model_request_parameters
             try:
                 _, prepared_parameters = model.prepare_request(
                     self._request_args.model_settings, self._request_args.model_request_parameters
@@ -130,6 +131,7 @@ class _FallbackStreamedResponse(StreamedResponse):
                 if await self._should_fallback_handler(exc):
                     self._exceptions.append(exc)
                     continue
+                self._on_model_selected(model, prepared_parameters)
                 raise exc
 
             self._current_model = model
@@ -179,7 +181,6 @@ class _FallbackStreamedResponse(StreamedResponse):
             assert self._current_model is not None
             assert self._current_prepared_parameters is not None
             self._accepted_model = self._current_model
-            self._on_model_selected(self._current_model, self._current_prepared_parameters)
             return
 
     async def close_stream(self) -> None:
@@ -195,9 +196,13 @@ class _FallbackStreamedResponse(StreamedResponse):
         # chunk, so we keep mirroring them rather than binding once per candidate.
         assert self._current_stream is not None
         self._usage = self._current_stream.usage
-        self.provider_response_id = self._current_stream.provider_response_id
-        self.provider_details = self._current_stream.provider_details
-        self.finish_reason = self._current_stream.finish_reason
+        if self._current_stream.provider_response_id is not None:
+            self.provider_response_id = self._current_stream.provider_response_id
+        if self._current_stream.provider_details is not None:
+            self.provider_details = self._current_stream.provider_details
+        if self._current_stream.finish_reason is not None:
+            self.finish_reason = self._current_stream.finish_reason
+        self.state = self._current_stream.state
 
     @property
     def model_name(self) -> str:
@@ -478,25 +483,6 @@ class FallbackModel(Model):
         and the normal fallback chain is tried.
         """
         pinned = self._get_continuation_model(messages)
-        if self._response_handlers or pinned is None:
-            async with AsyncExitStack() as stack:
-                response = _FallbackStreamedResponse(
-                    model_request_parameters=model_request_parameters,
-                    _models=self.models,
-                    _request_args=_StreamRequestArgs(
-                        messages=messages,
-                        model_settings=model_settings,
-                        model_request_parameters=model_request_parameters,
-                        run_context=run_context,
-                    ),
-                    _exit_stack=stack,
-                    _should_fallback_handler=self._should_fallback,
-                    _on_model_selected=self._set_span_attributes,
-                )
-                await response.open_next_stream()
-                yield response
-                return
-        exceptions: list[Exception] = []
         # Set once a pinned continuation fails and we rewind to the chain: see the non-streaming `request`.
         rewound = False
 
@@ -523,7 +509,6 @@ class FallbackModel(Model):
                         await pinned.cancel_suspended_response(suspended_response)
                     messages = _rewind_messages(messages)
                     rewound = True
-                    exceptions.append(exc)
                     # Fall through to normal chain below
                 else:
                     self._set_span_attributes(pinned, prepared_parameters)
@@ -535,39 +520,26 @@ class FallbackModel(Model):
                         _stamp_continuation(streamed_response, pinned)
                     return
 
-        for model in self.models:
-            async with AsyncExitStack() as stack:
-                prepared_parameters = model_request_parameters
-                try:
-                    _, prepared_parameters = model.prepare_request(model_settings, model_request_parameters)
-                    prepared_messages = model.prepare_messages(messages, model_request_parameters)
-                    streamed_response = await stack.enter_async_context(
-                        model.request_stream(prepared_messages, model_settings, model_request_parameters, run_context)
-                    )
-                except Exception as exc:
-                    if await self._should_fallback(exc):
-                        exceptions.append(exc)
-                        continue
-                    self._set_span_attributes(model, prepared_parameters)
-                    raise exc
-
-                # After a rewind, mark this fresh stream as replacing the abandoned suspended turn.
-                # Unlike the continuation pin (stamped after `yield`, once the final `state` is known),
-                # this must land on `metadata` *before* `yield`: the streamed composite resolves
-                # `_segment_offset` (via `merge_mode`) on the first reindexable event, so a late stamp
-                # would reindex against a stale `'accumulate'` verdict and misplace the parts. That this
-                # stream supersedes the suspended turn is known the moment the rewound chain is entered.
-                if rewound:
-                    _stamp_replace_previous(streamed_response)
-                self._set_span_attributes(model, prepared_parameters)
-                yield streamed_response
-                # Stamp after `yield` (see the pinned path above): `state` is only final once the
-                # caller has consumed the stream, so callers must call `get()` after the context exits.
-                if streamed_response.state == 'suspended':
-                    _stamp_continuation(streamed_response, model)
-                return
-
-        _raise_fallback_exception_group(exceptions, [])
+        async with AsyncExitStack() as stack:
+            response = _FallbackStreamedResponse(
+                model_request_parameters=model_request_parameters,
+                _models=self.models,
+                _request_args=_StreamRequestArgs(
+                    messages=messages,
+                    model_settings=model_settings,
+                    model_request_parameters=model_request_parameters,
+                    run_context=run_context,
+                ),
+                _exit_stack=stack,
+                _should_fallback_handler=self._should_fallback,
+                _on_model_selected=self._set_span_attributes,
+            )
+            if rewound:
+                _stamp_replace_previous(response)
+            await response.open_next_stream()
+            yield response
+            if response._accepted_model is not None and response.get().state == 'suspended':
+                _stamp_continuation(response, response._accepted_model)
 
     async def cancel_suspended_response(self, response: ModelResponse) -> None:
         """Cancel a suspended continuation on the underlying model holding the server-side job.

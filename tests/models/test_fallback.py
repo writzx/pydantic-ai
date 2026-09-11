@@ -43,16 +43,15 @@ from pydantic_ai._agent_graph import ModelRequestNode
 from pydantic_ai._run_context import RunContext
 from pydantic_ai.capabilities.instrumentation import Instrumentation
 from pydantic_ai.messages import (
-    AgentStreamEvent,
     AgentInstructionSource,
+    AgentStreamEvent,
     InstructionId,
     InstructionPart,
     ModelResponseState,
     NativeToolCallPart,
     NativeToolReturnPart,
-    ToolAvailabilityDeltaPart,
     ThinkingPart,
-    ToolReturnPart,
+    ToolAvailabilityDeltaPart,
 )
 from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse
 from pydantic_ai.models.fallback import FallbackModel, ResponseRejected
@@ -476,7 +475,7 @@ async def test_first_failed_instrumented_stream(capfire: CaptureLogfire) -> None
                     'model_request_parameters': {
                         'function_tools': [],
                         'native_tools': [],
-                        'tool_visibility': {},
+                        'tool_visibility': None,
                         'revealed_tool_names': [],
                         'deferred_capability_ids': [],
                         'output_mode': 'text',

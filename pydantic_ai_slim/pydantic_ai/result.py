@@ -324,7 +324,7 @@ class AgentStream(Generic[AgentDepsT, OutputDataT]):
             ),
         )
 
-    async def _stream_response_text(
+    async def _stream_response_text(  # noqa: C901
         self, *, delta: bool = False, debounce_by: float | None = 0.1
     ) -> AsyncIterator[str]:
         """Stream the response as an async iterable of text."""
